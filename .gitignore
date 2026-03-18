@@ -1,0 +1,10 @@
+# Ignore idea files
+.idea/
+
+# Ignore all image files
+**/*.jpg
+**/*.jpeg
+**/*.png
+**/*.gif
+**/*.bmp
+**/*.svg
