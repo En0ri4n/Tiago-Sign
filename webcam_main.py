@@ -5,8 +5,14 @@ from os import listdir
 from os.path import isfile, join
 import cv2
 
+import session_manager
+from mqtt_tracker import MQTTFaceTracker
+from camera_viewer import CameraViewer
+
 mtcnn = MTCNN(keep_all=True)  # keep_all=True to detect multiple faces per frame
 resnet = InceptionResnetV1(pretrained="vggface2").eval()
+
+session = session_manager.SessionManager()
 
 
 def compare_image(path_source: str, path_target: str) -> float:
@@ -96,7 +102,7 @@ def compare_webcam_to_gallery(gallery_folder: str, threshold: float = 0.8):
 
     print(f"Gallery ready: {len(gallery)} people loaded.\n")
 
-    cv2.namedWindow("preview")
+    viewer = CameraViewer(window_name="preview")
     vc = cv2.VideoCapture(0)
 
     if vc.isOpened():
@@ -105,41 +111,38 @@ def compare_webcam_to_gallery(gallery_folder: str, threshold: float = 0.8):
         rval = False
         print("Could not open webcam.")
 
+    tracker_mqtt = MQTTFaceTracker()
+    tracker_mqtt.start()
+
+    frame_skip = 4
+    frame_count = 0
+    last_boxes, last_names, last_distances, last_current_names = None, [], [], set()
+
     while rval:
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img_frame = Image.fromarray(frame_rgb)
 
-        boxes, _ = mtcnn.detect(img_frame)
-        faces = mtcnn(img_frame)
+        frame_count += 1
 
-        if faces is not None and boxes is not None:
-            embeddings = resnet(faces)  # batch inference
+        # Exécute la reconnaissance faciale 1 frame sur 4 pour soulager le CPU
+        if frame_count % frame_skip == 0:
+            last_boxes, last_names, last_distances, last_current_names = recognizer.process_frame(frame_rgb)
+            tracker_mqtt.update(last_current_names, session_manager)
 
-            for i, emb in enumerate(embeddings):
-                name, dist = find_best_match(emb.unsqueeze(0), gallery, threshold)
+        viewer.update_and_show(frame, last_boxes, last_names, last_distances, session_manager)
 
-                x1, y1, x2, y2 = [int(b) for b in boxes[i]]
-                color = (0, 255, 0) if name else (0, 0, 255)
-                label = f"{name} ({dist:.2f})" if name else f"Unknown ({dist:.2f})"
-
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, label, (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        else:
-            cv2.putText(frame, "No face detected", (10, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
-
-        cv2.imshow("preview", frame)
         rval, frame = vc.read()
-        key = cv2.waitKey(20)
+        key = viewer.wait_key(20)
         if key == 27:  # exit on ESC
             break
 
+    tracker_mqtt.stop()
     vc.release()
+    viewer.close()
     cv2.destroyAllWindows()
 
 
 def main():
+    import os
     os.makedirs("dataset", exist_ok=True)
     os.makedirs("output", exist_ok=True)
 

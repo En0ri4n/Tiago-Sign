@@ -1,16 +1,15 @@
 import paramiko
 import cv2
 import numpy as np
-import sounddevice as sd
-import threading
 from time import sleep
-from PIL import Image
-from webcam_main import mtcnn, resnet, load_gallery, find_best_match
+from mqtt_tracker import MQTTFaceTracker
+from camera_viewer import CameraViewer
+import face_recognizer
+import session_manager as sm
 
 SSH_HOST = 'tiago-201c'
 SSH_USER = 'pal'
 SSH_PASS = 'pal'
-GAIN = 5.0
 
 # Limites articulaires de la tête (en radians)
 # head_1_joint : gauche/droite  (~-1.3 à 1.3)
@@ -61,6 +60,12 @@ for line in sys.stdin:
     sys.stdout.flush()
 """
 
+recognizer = face_recognizer.FaceRecognizer(threshold=0.8)
+recognizer.load_gallery("gallery")
+
+session_manager = sm.SessionManager()
+viewer = CameraViewer(window_name="Tiago", show_controls=True)
+
 # ── Fonctions SSH ─────────────────────────────────────────────────────────────
 
 def start_head_controller(ssh):
@@ -83,36 +88,9 @@ def start_head_controller(ssh):
 def send_head_command(channel, cmd):
     channel.sendall((cmd + '\n').encode())
 
-
-# ── Audio ─────────────────────────────────────────────────────────────────────
-
-def stream_audio(ssh_audio):
-    transport = ssh_audio.get_transport()
-    channel = transport.open_session()
-    channel.exec_command('arecord -f S16_LE -r 44100 -c 1 -t raw 2>/dev/null')
-
-    stream = sd.RawOutputStream(samplerate=44100, channels=1, dtype='int16', blocksize=4096)
-    stream.start()
-    try:
-        while True:
-            data = channel.recv(4096 * 2)
-            if not data:
-                break
-            samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
-            samples *= GAIN
-            np.clip(samples, -32768, 32767, out=samples)
-            stream.write(samples.astype(np.int16).tobytes())
-    except Exception as e:
-        print(f"Erreur audio: {e}")
-    finally:
-        stream.stop()
-        stream.close()
-        channel.close()
-
-
 # ── Caméra + clavier ──────────────────────────────────────────────────────────
 
-def stream_camera(ssh_cam, head_channel, gallery, threshold=0.8):
+def stream_camera(ssh_cam, head_channel):
     script = """
 import rospy
 from sensor_msgs.msg import CompressedImage
@@ -120,9 +98,12 @@ import sys
 
 def callback(msg):
     data = bytes(msg.data)
-    sys.stdout.buffer.write(len(data).to_bytes(4, 'big'))
-    sys.stdout.buffer.write(data)
-    sys.stdout.buffer.flush()
+    try:
+        sys.stdout.buffer.write(len(data).to_bytes(4, 'big'))
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    except Exception as e:
+        rospy.signal_shutdown("SSH tunnel closed")
 
 rospy.init_node('stream_node', anonymous=True)
 rospy.Subscriber('/xtion/rgb/image_raw/compressed', CompressedImage, callback)
@@ -132,6 +113,7 @@ rospy.spin()
     sleep(1)
 
     transport = ssh_cam.get_transport()
+    transport.set_keepalive(10) # Pour éviter le socket timeout (10054)
     channel = transport.open_session()
     channel.exec_command('bash -lic "python3 /tmp/stream_camera.py"')
 
@@ -155,39 +137,39 @@ rospy.spin()
 
     print("Stream démarré. Flèches = tête | 'c' = centrer | 'q' = quitter")
 
+
+    # Initialisation de notre tracker MQTT
+    tracker_mqtt = MQTTFaceTracker()
+    tracker_mqtt.start()
+
+    frame_skip = 4
+    frame_count = 0
+    last_boxes, last_names, last_distances, last_current_names = None, [], [], set()
+
     while True:
         try:
-            size = int.from_bytes(read_exactly(4), 'big')
+            size_bytes = read_exactly(4)
+            size = int.from_bytes(size_bytes, 'big')
             jpeg_data = read_exactly(size)
             arr = np.frombuffer(jpeg_data, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
             if frame is not None:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img_frame = Image.fromarray(frame_rgb)
+                frame_count += 1
+                
+                # Exécute la reconnaissance faciale 1 frame sur 4 pour soulager le CPU
+                if frame_count % frame_skip == 0:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    last_boxes, last_names, last_distances, last_current_names = recognizer.process_frame(frame_rgb)
+                    
+                    # Mise à jour du tracker et envoi MQTT 
+                    tracker_mqtt.update(last_current_names, session_manager)
 
-                boxes, _ = mtcnn.detect(img_frame)
-                faces = mtcnn(img_frame)
+                # Affiche toujours la frame (fluide) mais avec les boites de la dernière détection
+                viewer.update_and_show(frame, last_boxes, last_names, last_distances, session_manager)
 
-                if faces is not None and boxes is not None:
-                    embeddings = resnet(faces)
 
-                    for i, emb in enumerate(embeddings):
-                        name, dist = find_best_match(emb.unsqueeze(0), gallery, threshold)
-
-                        x1, y1, x2, y2 = [int(b) for b in boxes[i]]
-                        color = (0, 255, 0) if name else (0, 0, 255)
-                        label = f"{name} ({dist:.2f})" if name else f"Unknown ({dist:.2f})"
-
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        cv2.putText(frame, label, (x1, y1 - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-                cv2.putText(frame, "Fleches: tete | c: centre | q: quitter",
-                            (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.imshow("Tiago", frame)
-
-            key = cv2.waitKey(1) & 0xFF
+            key = viewer.wait_key(1)
             if key == ord('q'):
                 break
             if key in KEY_MAP:
@@ -197,34 +179,29 @@ rospy.spin()
             print(f"Erreur vidéo: {e}")
             break
 
-    cv2.destroyAllWindows()
+    tracker_mqtt.stop()
+    viewer.close()
     channel.close()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    gallery = load_gallery("gallery")
-    if not gallery:
-        print("Galerie vide ou introuvable.")
-    else:
-        print(f"{len(gallery)} personnes chargées dans la galerie.")
-
     ssh_cam   = paramiko.SSHClient()
-    ssh_audio = paramiko.SSHClient()
+    # ssh_audio = paramiko.SSHClient()
     ssh_head  = paramiko.SSHClient()
 
-    for ssh in (ssh_cam, ssh_audio, ssh_head):
+    for ssh in (ssh_cam, '''ssh_audio, ssh_head'''):
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(SSH_HOST, username=SSH_USER, password=SSH_PASS)
 
     head_channel = start_head_controller(ssh_head)
 
-    threading.Thread(target=stream_audio, args=(ssh_audio,), daemon=True).start()
+    # threading.Thread(target=stream_audio, args=(ssh_audio,), daemon=True).start()
 
-    stream_camera(ssh_cam, head_channel, gallery)
+    stream_camera(ssh_cam, head_channel)
 
-    for ssh in (ssh_cam, ssh_audio, ssh_head):
+    for ssh in (ssh_cam, '''ssh_audio, ssh_head'''):
         ssh.close()
 
 
