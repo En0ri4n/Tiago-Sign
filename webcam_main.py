@@ -8,11 +8,16 @@ import cv2
 import session_manager
 from mqtt_tracker import MQTTFaceTracker
 from camera_viewer import CameraViewer
+import face_recognizer
 
 mtcnn = MTCNN(keep_all=True)  # keep_all=True to detect multiple faces per frame
 resnet = InceptionResnetV1(pretrained="vggface2").eval()
 
 session = session_manager.SessionManager()
+
+
+recognizer = face_recognizer.FaceRecognizer(threshold=0.8)
+recognizer.load_gallery("gallery")
 
 
 def compare_image(path_source: str, path_target: str) -> float:
@@ -93,14 +98,6 @@ def compare_webcam_to_gallery(gallery_folder: str, threshold: float = 0.8):
     :param gallery_folder: Folder containing one reference image per person
     :param threshold: Distance threshold — below this is considered a match
     """
-    print("Loading gallery...")
-    gallery = load_gallery(gallery_folder)
-
-    if not gallery:
-        print("Gallery is empty. Add images to the dataset folder.")
-        return
-
-    print(f"Gallery ready: {len(gallery)} people loaded.\n")
 
     viewer = CameraViewer(window_name="preview")
     vc = cv2.VideoCapture(0)
@@ -126,9 +123,9 @@ def compare_webcam_to_gallery(gallery_folder: str, threshold: float = 0.8):
         # Exécute la reconnaissance faciale 1 frame sur 4 pour soulager le CPU
         if frame_count % frame_skip == 0:
             last_boxes, last_names, last_distances, last_current_names = recognizer.process_frame(frame_rgb)
-            tracker_mqtt.update(last_current_names, session_manager)
+            tracker_mqtt.update(last_current_names, session)
 
-        viewer.update_and_show(frame, last_boxes, last_names, last_distances, session_manager)
+        viewer.update_and_show(frame, last_boxes, last_names, last_distances, session)
 
         rval, frame = vc.read()
         key = viewer.wait_key(20)
@@ -142,15 +139,6 @@ def compare_webcam_to_gallery(gallery_folder: str, threshold: float = 0.8):
 
 
 def main():
-    import os
-    os.makedirs("dataset", exist_ok=True)
-    os.makedirs("output", exist_ok=True)
-
-    images_file = [f for f in listdir("dataset") if isfile(join("dataset", f))]
-
-    if not images_file:
-        print("No images found in dataset/")
-        return
 
     # --- Run webcam recognition against the full gallery ---
     compare_webcam_to_gallery("gallery", threshold=0.8)

@@ -1,6 +1,7 @@
 import time
 import json
 import paho.mqtt.client as mqtt
+import datetime
 
 class MQTTFaceTracker:
     def __init__(self, broker_ip="10.167.129.217", port=1883, topic="edusign/attend/tiago", presence_time=3.0, tolerance=1.0):
@@ -40,7 +41,7 @@ class MQTTFaceTracker:
 
             # Si on l'a vu pendant le temps requis (ex: 3s) et pas encore publié
             if not self.tracked_persons[name]["published"] and (current_time - self.tracked_persons[name]["first_seen"] >= self.presence_time):
-                payload = json.dumps({"name": name, "id": name})
+                payload = json.dumps({"name": name, "id": len(name), "timestamp": datetime.datetime.now().isoformat()})
                 self.client.publish(self.topic, payload)
                 print(f"[MQTT] Envoyé: {payload}")
                 self.tracked_persons[name]["published"] = True
